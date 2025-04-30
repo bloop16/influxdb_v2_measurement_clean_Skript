@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Variablen
-BUCKET="iobroker"
-ORG="iobroker"
+BUCKET="DEIN_BUCKET"
+ORG="DEINE_ORGANISATION"
 TOKEN="DEIN_API_TOKEN"  # Setze dein InfluxDB API-Token hier ein
 URL="http://localhost:8086"  # URL der InfluxDB
 OLDER_THAN="30d"  # Zeitraum, älter als 30 Tage
