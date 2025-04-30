@@ -25,10 +25,9 @@ echo ""
 echo "Suche nach Measurements, die seit mehr als $OLDER_THAN nicht aktualisiert wurden..."
 MEASUREMENTS=$(influx query '
 from(bucket: "'"$BUCKET"'")
-  |> range(start: -'"$OLDER_THAN"')
-  |> group(columns: ["_measurement"])
-  |> keep(columns: ["_measurement", "_time"])
-  |> last()
+  |> range(start: -30d)
+  |> group(columns: ["_field"])
+  |> distinct(column: "_field")
 ' --org "$ORG" --token "$TOKEN" --raw | awk -F',' '{print $1}' | tail -n +2)
 
 # Überprüfen, ob Measurements gefunden wurden
