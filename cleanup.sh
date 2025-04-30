@@ -1,13 +1,27 @@
 #!/bin/bash
 
-# Variablen
-BUCKET="DEIN_BUCKET"
-ORG="DEINE_ORGANISATION"
-TOKEN="DEIN_API_TOKEN"  # Setze dein InfluxDB API-Token hier ein
-URL="http://localhost:8086"  # URL der InfluxDB
-OLDER_THAN="30d"  # Zeitraum, älter als 30 Tage
+# Einleitung
+echo "Willkommen zum InfluxDB-Cleanup-Skript!"
+echo "Dieses Skript hilft dir, alte Measurements in InfluxDB zu identifizieren und zu löschen."
+echo ""
 
-# Schritt 1: Measurements abrufen, die seit 1 Monat nicht aktualisiert wurden
+# Benutzer nach Eingaben fragen
+read -p "Bitte gib den Namen des Buckets ein: " BUCKET
+read -p "Bitte gib den Namen der Organisation ein: " ORG
+read -p "Bitte gib dein API-Token ein: " TOKEN
+read -p "Bitte gib den Zeitraum (z. B. 30d) ein, für den ältere Daten gesucht werden sollen: " OLDER_THAN
+read -p "Bitte gib die URL deiner InfluxDB-Instanz ein (Standard: http://localhost:8086): " URL
+URL=${URL:-http://localhost:8086}  # Standardwert setzen, falls nichts eingegeben wird
+
+echo ""
+echo "Folgende Parameter wurden gesetzt:"
+echo "Bucket: $BUCKET"
+echo "Organisation: $ORG"
+echo "Zeitraum: Älter als $OLDER_THAN"
+echo "URL: $URL"
+echo ""
+
+# Schritt 1: Measurements abrufen, die seit X Tagen nicht aktualisiert wurden
 echo "Suche nach Measurements, die seit mehr als $OLDER_THAN nicht aktualisiert wurden..."
 MEASUREMENTS=$(influx query '
 from(bucket: "'"$BUCKET"'")
