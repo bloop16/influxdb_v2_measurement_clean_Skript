@@ -1,5 +1,7 @@
 # InfluxDB Measurement Cleanup Script
 
+### WORK IN PROGRESS ###
+
 Ein Bash-Skript, um in InfluxDB 2 Messungen (`Measurements`) zu bereinigen, die seit einem bestimmten Zeitraum nicht mehr aktualisiert wurden.
 
 ## 📜 Funktionen
