@@ -1,47 +1,79 @@
 #!/bin/bash
 
-# Einleitung
-echo "Willkommen zum InfluxDB-Cleanup-Skript!"
-echo "Dieses Skript hilft dir, inaktive Measurements in InfluxDB zu identifizieren und zu löschen."
-echo ""
+CONFIG_FILE="./cleanup.config"
 
-# Benutzer nach Eingaben fragen
-read -p "Bitte gib den Namen des Buckets ein: " BUCKET
-read -p "Bitte gib den Namen der Organisation ein: " ORG
-read -p "Bitte gib dein API-Token ein: " TOKEN
-read -p "Bitte gib den Zeitraum (z. B. 30d) ein, für den keine neuen Daten mehr vorhanden sein sollen: " OLDER_THAN
-OLDER_THAN=${OLDER_THAN:-30d}  # Standardwert 30d setzen, falls nichts eingegeben wird
-read -p "Bitte gib die URL deiner InfluxDB-Instanz ein (Standard: http://localhost:8086): " URL
-URL=${URL:-http://localhost:8086}  # Standardwert setzen, falls nichts eingegeben wird
-
-# Verbindung testen mit Timeout
-echo "Prüfe die Verbindung zu InfluxDB unter $URL..."
-if ! curl --silent --connect-timeout 5 --max-time 10 --head "$URL" | grep "HTTP/1.1 200 OK" > /dev/null; then
-  echo "Fehler: Verbindung zur InfluxDB-Instanz fehlgeschlagen. Bitte überprüfe die URL oder den Serverstatus."
+# Read configuration file
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Error: Configuration file $CONFIG_FILE not found!"
+  echo "Please create a file cleanup.config with the following content:"
+  echo "BUCKET=your_bucket"
+  echo "ORG=your_organization"
+  echo "TOKEN=your_token"
+  echo "OLDER_THAN=30d"
+  echo "URL=http://localhost:8086"
   exit 1
 fi
-echo "Verbindung erfolgreich!"
 
+# Load parameters from config file
+source "$CONFIG_FILE"
+
+# Check if all variables are set
+if [[ -z "$BUCKET" || -z "$ORG" || -z "$TOKEN" || -z "$OLDER_THAN" || -z "$URL" ]]; then
+  echo "Error: Not all parameters are set in cleanup.config!"
+  exit 1
+fi
+
+# Introduction
 echo ""
-echo "Folgende Parameter wurden gesetzt:"
+echo ""
+echo "-----------------------------------------------"
+echo "|      Welcome to the InfluxDB Cleanup Tool!   |"
+echo "-----------------------------------------------"
+echo ""
+echo "This script helps you identify and delete inactive measurements in InfluxDB."
+echo ""
+echo "The following parameters have been loaded:"
 echo "Bucket: $BUCKET"
-echo "Organisation: $ORG"
-echo "Zeitraum: Keine neuen Daten seit $OLDER_THAN"
+echo "Organization: $ORG"
+echo "Time period: No new data for $OLDER_THAN"
 echo "URL: $URL"
 echo ""
 
-# Funktion zur Statusanzeige
+# Confirmation before connection test
+read -p "Continue with these parameters and test connection? (y/n): " CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+  echo "Aborted by user."
+  exit 0
+fi
+
+# Test connection with retry option
+while true; do
+  echo "Testing connection to InfluxDB at $URL..."
+  if curl --silent --connect-timeout 5 --max-time 10 --head "$URL" | grep "HTTP/1.1 200 OK" > /dev/null; then
+    echo "Connection successful!"
+    break
+  else
+    echo "Error: Connection to InfluxDB instance failed."
+    read -p "Try again? (y/n): " RETRY
+    if [[ "$RETRY" != "y" ]]; then
+      echo "Script will exit."
+      exit 1
+    fi
+  fi
+done
+
+# Status log function
 function log_status {
   echo "[Status] $1"
 }
 
-# Funktion zur Fehlerüberprüfung mit Optionen für Nichtbeenden
+# Error check function with optional exit
 function check_error {
   local error_message="$1"
   local exit_on_error="${2:-true}"
   
   if [ $? -ne 0 ]; then
-    echo "Fehler: $error_message"
+    echo "Error: $error_message"
     if [ "$exit_on_error" = true ]; then
       exit 1
     fi
@@ -50,226 +82,175 @@ function check_error {
   return 0
 }
 
-# Funktion zum Extrahieren von Measurement-Namen aus InfluxDB-Ausgabe
-function extract_measurements {
-  local output="$1"
-  local measurements=()
-  
-  while IFS= read -r line; do
-    if [[ ! "$line" =~ ^# && ! "$line" =~ ^$ && "$line" =~ [a-zA-Z0-9] ]]; then
-      measurement=$(echo "$line" | awk -F',' '{print $4}')
-      if [[ ! -z "$measurement" && "$measurement" != "_measurement" ]]; then
-        measurements+=("$measurement")
-      fi
-    fi
-  done <<< "$output"
-  
-  echo "${measurements[@]}"
-}
+# Get last value for each measurement
+log_status "Last value for each measurement in bucket '$BUCKET':"
+echo "-----------------------------------------------"
+echo "Measurement; Timestamp; Value"
 
-# Arrays für die Measurements erstellen
-ALL_MEASUREMENTS=()
-ACTIVE_MEASUREMENTS=()
+# Get measurements (names only) with debug output
+echo "Fetching all measurements..."
+RAW_MEASUREMENTS=$(influx query 'import "influxdata/influxdb/schema"
+schema.measurements(bucket: "'"$BUCKET"'")' --org "$ORG" --token "$TOKEN" --host "$URL" --raw 2>&1)
+
+ALL_MEASUREMENTS=$(echo "$RAW_MEASUREMENTS" | awk -F, 'NR>3 {print $4}' | tr -d '\r' | grep -v '^$')
+echo "Filtered measurement names:"
+echo "$ALL_MEASUREMENTS"
+echo "-----------------------------------------------"
+echo "Number of measurements: $(echo "$ALL_MEASUREMENTS" | wc -l)"
+echo "-----------------------------------------------"
+
+if [[ -z "$ALL_MEASUREMENTS" ]]; then
+  echo "[Error] No measurements found! Check connection and bucket name."
+  exit 1
+fi
+
 INACTIVE_MEASUREMENTS=()
 
-# Schritt 1: Alle Measurements mit verschiedenen Datentypen finden
-log_status "Verbindung zu InfluxDB unter $URL..."
-log_status "Suche nach allen Measurements (nach Datentyp getrennt)..."
+IFS=$'\n'
+for MEAS in $ALL_MEASUREMENTS; do
+  [ -z "$MEAS" ] && continue
+  LAST_LINE=$(influx query "from(bucket: \"$BUCKET\")
+    |> range(start: 0)
+    |> filter(fn: (r) => r._measurement == \"$MEAS\" and r._field == \"value\")
+    |> sort(columns:[\"_time\"], desc:true)
+    |> limit(n:1)" \
+    --org "$ORG" --token "$TOKEN" --host "$URL" --raw 2>/dev/null \
+    | awk -F, -v meas="$MEAS" '$0 ~ /^,,/ && NF >= 8 { n = NF; print meas ";" $(n-3) ";" $(n-2) ";" $(n-1) }')
 
-# Query für float-Werte mit Timeout
-log_status "Suche nach Measurements mit float-Werten..."
-FLOAT_MEASUREMENTS_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -10y)
-  |> filter(fn: (r) => types.isType(v: r._value, type: "float"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
+  echo "$LAST_LINE"
 
-if [ $? -eq 0 ] && [ ! -z "$FLOAT_MEASUREMENTS_OUTPUT" ]; then
-  echo "Float-Measurements erfolgreich abgefragt."
-  FLOAT_MEASUREMENTS=($(extract_measurements "$FLOAT_MEASUREMENTS_OUTPUT"))
-  ALL_MEASUREMENTS+=("${FLOAT_MEASUREMENTS[@]}")
-  echo "Gefundene Float-Measurements: ${#FLOAT_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine Float-Measurements gefunden oder Abfrage fehlgeschlagen."
+  LAST_TS=$(echo "$LAST_LINE" | awk -F';' '{print $2}')
+  LAST_TS_EPOCH=$(date -d "$LAST_TS" +%s 2>/dev/null)
+  OLDER_THAN_DAYS=$(echo "$OLDER_THAN" | grep -o '[0-9]\+')
+  LIMIT_TS_EPOCH=$(date -d "$(date +%Y-%m-%d) -$OLDER_THAN_DAYS days" +%s)
+  echo "$MEAS: LAST_TS=$LAST_TS, LAST_TS_EPOCH=$LAST_TS_EPOCH, LIMIT_TS_EPOCH=$LIMIT_TS_EPOCH"
+  if [ -n "$LAST_TS_EPOCH" ] && [ -n "$LIMIT_TS_EPOCH" ]; then
+    if [ "$LAST_TS_EPOCH" -lt "$LIMIT_TS_EPOCH" ]; then
+      echo "$MEAS is recognized as inactive!"
+      INACTIVE_MEASUREMENTS+=("$MEAS;;$LAST_TS")
+    fi
+  echo ""
+  fi
+done
+unset IFS
+
+echo "-----------------------------------------------"
+echo "Inactive measurements (older than $OLDER_THAN):"
+for INACTIVE in "${INACTIVE_MEASUREMENTS[@]}"; do
+  MEAS_NAME=$(echo "$INACTIVE" | awk -F';;' '{print $1}')
+  MEAS_TS=$(echo "$INACTIVE" | awk -F';;' '{print $2}')
+  echo "$MEAS_NAME ($MEAS_TS)"
+done
+echo "-----------------------------------------------"
+
+if [ "${#INACTIVE_MEASUREMENTS[@]}" -eq 0 ]; then
+  echo "No inactive measurements found."
+  echo "Done."
+  exit 0
 fi
 
-# Query für string-Werte mit Timeout
-log_status "Suche nach Measurements mit string-Werten..."
-STRING_MEASUREMENTS_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -10y)
-  |> filter(fn: (r) => types.isType(v: r._value, type: "string"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
+# Lists for summary
+DELETED_MEASUREMENTS=()
+KEPT_MEASUREMENTS=()
 
-if [ $? -eq 0 ] && [ ! -z "$STRING_MEASUREMENTS_OUTPUT" ]; then
-  echo "String-Measurements erfolgreich abgefragt."
-  STRING_MEASUREMENTS=($(extract_measurements "$STRING_MEASUREMENTS_OUTPUT"))
-  ALL_MEASUREMENTS+=("${STRING_MEASUREMENTS[@]}")
-  echo "Gefundene String-Measurements: ${#STRING_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine String-Measurements gefunden oder Abfrage fehlgeschlagen."
-fi
+# Selection menu with repeat on invalid input
+while true; do
+  echo "What do you want to do?"
+  echo "1 = Delete all inactive measurements"
+  echo "2 = Ask for each inactive measurement"
+  echo "q = Do not delete any measurement"
+  read -p "Choice: " ACTION
 
-# Query für boolean-Werte mit Timeout
-log_status "Suche nach Measurements mit boolean-Werten..."
-BOOLEAN_MEASUREMENTS_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -10y)
-  |> filter(fn: (r) => types.isType(v: r._value, type: "bool"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
+  if [[ "$ACTION" == "1" ]]; then
+    read -p "Are you sure you want to DELETE ALL inactive measurements? (y/n): " CONFIRM_ALL
+    if [[ "$CONFIRM_ALL" == "y" ]]; then
+      for INACTIVE in "${INACTIVE_MEASUREMENTS[@]}"; do
+        MEAS_NAME=$(echo "$INACTIVE" | awk -F';;' '{print $1}')
+        MEAS_TS=$(echo "$INACTIVE" | awk -F';;' '{print $2}')
+        echo "Deleting: $MEAS_NAME"
+        influx delete --bucket "$BUCKET" --org "$ORG" --token "$TOKEN" --host "$URL" --predicate "_measurement=\"$MEAS_NAME\"" --start 1970-01-01T00:00:00Z --stop $(date +%Y-%m-%dT%H:%M:%SZ)
+        DELETED_MEASUREMENTS+=("$MEAS_NAME")
+      done
+      echo "All inactive measurements have been deleted."
+      break
+    else
+      echo "Aborted. Nothing was deleted."
+      KEPT_MEASUREMENTS=("${INACTIVE_MEASUREMENTS[@]}")
+      break
+    fi
+  elif [[ "$ACTION" == "2" ]]; then
+    for INACTIVE in "${INACTIVE_MEASUREMENTS[@]}"; do
+      MEAS_NAME=$(echo "$INACTIVE" | awk -F';;' '{print $1}')
+      MEAS_TS=$(echo "$INACTIVE" | awk -F';;' '{print $2}')
+      while true; do
+        read -p "Delete measurement $MEAS_NAME? (y/n): " CONFIRM_ONE
+        if [[ "$CONFIRM_ONE" == "y" ]]; then
+          echo "Deleting: $MEAS_NAME"
+          influx delete --bucket "$BUCKET" --org "$ORG" --token "$TOKEN" --host "$URL" --predicate "_measurement=\"$MEAS_NAME\"" --start 1970-01-01T00:00:00Z --stop $(date +%Y-%m-%dT%H:%M:%SZ)
+          DELETED_MEASUREMENTS+=("$MEAS_NAME")
+          echo ""
+          break
+        elif [[ "$CONFIRM_ONE" == "n" ]]; then
+          echo "$MEAS_NAME will be kept."
+          KEPT_MEASUREMENTS+=("$MEAS_NAME")
+          echo ""
+          break
+        else
+          echo "Invalid input. Please enter 'y' or 'n'."
+        fi
+      done
+    done
+    break
+  elif [[ "$ACTION" == "q" ]]; then
+    echo "Nothing was deleted."
+    KEPT_MEASUREMENTS=("${INACTIVE_MEASUREMENTS[@]}")
+    break
+  else
+    echo "Invalid choice. Please select again."
+  fi
+done
 
-if [ $? -eq 0 ] && [ ! -z "$BOOLEAN_MEASUREMENTS_OUTPUT" ]; then
-  echo "Boolean-Measurements erfolgreich abgefragt."
-  BOOLEAN_MEASUREMENTS=($(extract_measurements "$BOOLEAN_MEASUREMENTS_OUTPUT"))
-  ALL_MEASUREMENTS+=("${BOOLEAN_MEASUREMENTS[@]}")
-  echo "Gefundene Boolean-Measurements: ${#BOOLEAN_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine Boolean-Measurements gefunden oder Abfrage fehlgeschlagen."
-fi
-
-# Schritt 2: Aktive Measurements mit verschiedenen Datentypen finden
-log_status "Suche nach aktiven Measurements (nach Datentyp getrennt)..."
-
-# Query für aktive float-Werte mit Timeout
-log_status "Suche nach aktiven Measurements mit float-Werten..."
-ACTIVE_FLOAT_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -'"$OLDER_THAN"')
-  |> filter(fn: (r) => types.isType(v: r._value, type: "float"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
-
-if [ $? -eq 0 ] && [ ! -z "$ACTIVE_FLOAT_OUTPUT" ]; then
-  echo "Aktive Float-Measurements erfolgreich abgefragt."
-  ACTIVE_FLOAT_MEASUREMENTS=($(extract_measurements "$ACTIVE_FLOAT_OUTPUT"))
-  ACTIVE_MEASUREMENTS+=("${ACTIVE_FLOAT_MEASUREMENTS[@]}")
-  echo "Gefundene aktive Float-Measurements: ${#ACTIVE_FLOAT_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine aktiven Float-Measurements gefunden oder Abfrage fehlgeschlagen."
-fi
-
-# Query für aktive string-Werte mit Timeout
-log_status "Suche nach aktiven Measurements mit string-Werten..."
-ACTIVE_STRING_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -'"$OLDER_THAN"')
-  |> filter(fn: (r) => types.isType(v: r._value, type: "string"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
-
-if [ $? -eq 0 ] && [ ! -z "$ACTIVE_STRING_OUTPUT" ]; then
-  echo "Aktive String-Measurements erfolgreich abgefragt."
-  ACTIVE_STRING_MEASUREMENTS=($(extract_measurements "$ACTIVE_STRING_OUTPUT"))
-  ACTIVE_MEASUREMENTS+=("${ACTIVE_STRING_MEASUREMENTS[@]}")
-  echo "Gefundene aktive String-Measurements: ${#ACTIVE_STRING_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine aktiven String-Measurements gefunden oder Abfrage fehlgeschlagen."
-fi
-
-# Query für aktive boolean-Werte mit Timeout
-log_status "Suche nach aktiven Measurements mit boolean-Werten..."
-ACTIVE_BOOLEAN_OUTPUT=$(timeout 60 influx query '
-import "types"
-from(bucket: "'"$BUCKET"'")
-  |> range(start: -'"$OLDER_THAN"')
-  |> filter(fn: (r) => types.isType(v: r._value, type: "bool"))
-  |> group(columns: ["_measurement"])
-  |> distinct(column: "_measurement")
-' --org "$ORG" --token "$TOKEN" --raw 2> /dev/null)
-
-if [ $? -eq 0 ] && [ ! -z "$ACTIVE_BOOLEAN_OUTPUT" ]; then
-  echo "Aktive Boolean-Measurements erfolgreich abgefragt."
-  ACTIVE_BOOLEAN_MEASUREMENTS=($(extract_measurements "$ACTIVE_BOOLEAN_OUTPUT"))
-  ACTIVE_MEASUREMENTS+=("${ACTIVE_BOOLEAN_MEASUREMENTS[@]}")
-  echo "Gefundene aktive Boolean-Measurements: ${#ACTIVE_BOOLEAN_MEASUREMENTS[@]}"
-else
-  echo "Warnung: Keine aktiven Boolean-Measurements gefunden oder Abfrage fehlgeschlagen."
-fi
-
-# Entferne Duplikate aus den Arrays
-ALL_MEASUREMENTS=($(echo "${ALL_MEASUREMENTS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
-ACTIVE_MEASUREMENTS=($(echo "${ACTIVE_MEASUREMENTS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
-
-echo "Gefundene Measurements insgesamt: ${#ALL_MEASUREMENTS[@]}"
-echo "Gefundene aktive Measurements: ${#ACTIVE_MEASUREMENTS[@]}"
-
-# Finde inaktive Measurements (in ALL_MEASUREMENTS, aber nicht in ACTIVE_MEASUREMENTS)
-for measurement in "${ALL_MEASUREMENTS[@]}"; do
-  is_active=false
-  for active in "${ACTIVE_MEASUREMENTS[@]}"; do
-    if [[ "$measurement" == "$active" ]]; then
-      is_active=true
+# Summary
+echo "-----------------------------------------------"
+echo "Summary:"
+echo "Active measurements:"
+IFS=$'\n'
+echo "$ALL_MEASUREMENTS" | while read -r MEAS; do
+  FOUND=0
+  for INACTIVE in "${INACTIVE_MEASUREMENTS[@]}"; do
+    MEAS_NAME=$(echo "$INACTIVE" | awk -F';;' '{print $1}')
+    if [[ "$MEAS" == "$MEAS_NAME" ]]; then
+      FOUND=1
       break
     fi
   done
-  
-  if [[ "$is_active" == "false" ]]; then
-    INACTIVE_MEASUREMENTS+=("$measurement")
+  if [[ $FOUND -eq 0 ]]; then
+    echo "$MEAS"
   fi
+done
+unset IFS
+
+echo ""
+echo "--------------------------------"
+echo "Inactive measurements:"
+for INACTIVE in "${INACTIVE_MEASUREMENTS[@]}"; do
+  echo "$INACTIVE"
 done
 
 echo ""
-echo "Gefundene inaktive Measurements (ohne neue Daten seit $OLDER_THAN):"
-for measurement in "${INACTIVE_MEASUREMENTS[@]}"; do
-  echo "- $measurement"
+echo "--------------------------------"
+echo "Deleted measurements:"
+for DEL in "${DELETED_MEASUREMENTS[@]}"; do
+  echo "$DEL"
 done
 
-# Anzeige der Gesamtzahl der Measurements
 echo ""
-echo "Zusammenfassung:"
-echo "Alle Measurements: ${#ALL_MEASUREMENTS[@]}"
-echo "Aktive Measurements: ${#ACTIVE_MEASUREMENTS[@]}"
-echo "Inaktive Measurements: ${#INACTIVE_MEASUREMENTS[@]}"
+echo "--------------------------------"
+echo "Kept (not deleted) inactive measurements:"
+for KEEP in "${KEPT_MEASUREMENTS[@]}"; do
+  echo "$KEEP"
+done
 
-# Schritt 3: Measurements löschen nach Bestätigung
-if [[ ${#INACTIVE_MEASUREMENTS[@]} -gt 0 ]]; then
-  echo ""
-  echo "Möchtest du fortfahren und inaktive Measurements löschen? (ja/nein)"
-  read -p "Deine Auswahl: " CONTINUE
-
-  if [[ "$CONTINUE" == "ja" ]]; then
-    TOTAL_MEASUREMENTS=${#INACTIVE_MEASUREMENTS[@]}
-    CURRENT_MEASUREMENT=0
-    
-    for MEASUREMENT in "${INACTIVE_MEASUREMENTS[@]}"; do
-      CURRENT_MEASUREMENT=$((CURRENT_MEASUREMENT + 1))
-      PERCENT=$((CURRENT_MEASUREMENT * 100 / TOTAL_MEASUREMENTS))
-      
-      echo "Fortschritt: $PERCENT% ($CURRENT_MEASUREMENT/$TOTAL_MEASUREMENTS)"
-      echo "Measurement: $MEASUREMENT"
-      read -p "Soll dieses Measurement gelöscht werden? (ja/nein): " CONFIRMATION
-      if [[ "$CONFIRMATION" == "ja" ]]; then
-        echo "Lösche $MEASUREMENT..."
-        influx delete \
-          --bucket "$BUCKET" \
-          --org "$ORG" \
-          --start "1970-01-01T00:00:00Z" \
-          --stop "$(date -Iseconds --utc)" \
-          --predicate "_measurement=\"$MEASUREMENT\"" \
-          --token "$TOKEN"
-        echo "Measurement $MEASUREMENT gelöscht."
-      else
-        echo "Measurement $MEASUREMENT wurde nicht gelöscht."
-      fi
-    done
-  else
-    echo "Abbruch durch Benutzer."
-  fi
-else
-  echo "Keine inaktiven Measurements gefunden. Nichts zu löschen."
-fi
-
-echo "Skript abgeschlossen."
+echo "-----------------------------------------------"
+echo "Done."
+exit 0
