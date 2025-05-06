@@ -1,12 +1,8 @@
 # InfluxDB Measurement Cleanup Script
 
-<<<<<<< HEAD
 A Bash script to identify and (optionally) delete InfluxDB 2 measurements that have not been updated for a specified period.
-=======
-### WORK IN PROGRESS ###
 
-Ein Bash-Skript, um in InfluxDB 2 Messungen (`Measurements`) zu bereinigen, die seit einem bestimmten Zeitraum nicht mehr aktualisiert wurden.
->>>>>>> bf2af380aa9d7d9a6be9a7ad7ea2cf8ceba645f1
+=======
 
 ## ⚠️ Warning
 
