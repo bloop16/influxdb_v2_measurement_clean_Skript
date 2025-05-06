@@ -2,7 +2,7 @@
 
 A Bash script to identify and (optionally) delete InfluxDB 2 measurements that have not been updated for a specified period.
 
-=======
+============================================
 
 ## ⚠️ Warning
 
